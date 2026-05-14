@@ -12,7 +12,10 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
+@dp.message()
+async def debug(message: types.Message):
+    print("DEBUG:", message.text)
+    
 # ===== DB =====
 conn = sqlite3.connect("bot.db")
 cur = conn.cursor()
