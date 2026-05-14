@@ -1,8 +1,10 @@
 import asyncio
 import os
+import sqlite3
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+# ===== TOKEN =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
@@ -11,106 +13,127 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ====== РОЛИ (простая система) ======
-ADMINS = set()     # можно добавить свой ID
-WORKERS = set()    # работники
+# ===== DB =====
+conn = sqlite3.connect("bot.db")
+cur = conn.cursor()
 
-# ====== ЗАЯВКИ ======
-orders = {}
-order_id = 1
+cur.execute("""
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount REAL,
+    status TEXT,
+    worker_id INTEGER
+)
+""")
+conn.commit()
 
-# ====== МЕНЮ ======
-def main_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="💳 Карта под оплату")],
-            [KeyboardButton(text="📋 Мои заявки")],
-            [KeyboardButton(text="🧑‍💼 Взять заявку (worker)")],
+# ===== STATE =====
+waiting_amount = {}
+
+# ===== KEYBOARD =====
+def order_keyboard(order_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="❤️ Взять в работу",
+                callback_data=f"take_{order_id}"
+            )
         ],
-        resize_keyboard=True
-    )
+        [
+            InlineKeyboardButton(
+                text="⏪ Назад",
+                callback_data="back"
+            )
+        ]
+    ])
 
-# ====== /start ======
+# ===== START =====
 @dp.message(F.text == "/start")
 async def start(message: types.Message):
-    await message.answer("Бот запущен 🚀", reply_markup=main_menu())
+    await message.answer("🚀 Бот запущен")
 
-# ====== СОЗДАТЬ ЗАЯВКУ ======
-@dp.message(F.text == "💳 Карта под оплату")
-async def create_order(message: types.Message):
-    global order_id
+# ===== CREATE ORDER BUTTON =====
+@dp.message(F.text == "💳 Новая заявка")
+async def new_order(message: types.Message):
 
-    orders[order_id] = {
-        "id": order_id,
-        "user_id": message.from_user.id,
-        "status": "NEW",
-        "worker_id": None,
-        "amount": None
-    }
+    waiting_amount[message.from_user.id] = True
 
-    await message.answer(f"✅ Заявка #{order_id} создана")
+    await message.answer(
+        "💳 Карта под оплату\n\n"
+        "Введите сумму в RUB, на которую нужна карта.\n"
+        "После подтверждения работник отправит реквизиты для оплаты.\n\n"
+        "💸 Сумма заявки: в рублях\n"
+        "Пример: 500"
+    )
 
-    order_id += 1
+# ===== AMOUNT INPUT =====
+@dp.message(F.text.isdigit())
+async def set_amount(message: types.Message):
 
-# ====== МОИ ЗАЯВКИ ======
-@dp.message(F.text == "📋 Мои заявки")
-async def my_orders(message: types.Message):
     uid = message.from_user.id
 
-    user_orders = [
-        f"#{o['id']} | {o['status']} | worker={o['worker_id']}"
-        for o in orders.values()
-        if o["user_id"] == uid
-    ]
-
-    if not user_orders:
-        await message.answer("У тебя нет заявок")
+    if uid not in waiting_amount:
         return
 
-    await message.answer("\n".join(user_orders))
+    amount = float(message.text)
+    waiting_amount.pop(uid)
 
-# ====== ВЗЯТЬ ЗАЯВКУ (WORKER SYSTEM) ======
-@dp.message(F.text == "🧑‍💼 Взять заявку (worker)")
-async def take_order(message: types.Message):
-    uid = message.from_user.id
+    cur.execute(
+        "INSERT INTO orders (user_id, amount, status, worker_id) VALUES (?, ?, ?, ?)",
+        (uid, amount, "NEW", None)
+    )
+    conn.commit()
 
-    # если заявка уже есть
-    for o in orders.values():
-        if o["status"] == "NEW":
-            o["status"] = "IN_PROGRESS"
-            o["worker_id"] = uid
+    order_id = cur.lastrowid
 
-            await message.answer(f"🟢 Ты взял заявку #{o['id']}")
-            return
+    text = f"""
+📥 Доступна новая заявка #{order_id}
+Метод: Карта под оплату
+Сумма операции: {amount:.2f} руб.
+💳 Можно выдать обычную карту
+Сумма заявки: {amount:.2f} RUB
+Резерв клиента: {round(amount / 63.7, 2)} USDT
+⏱️ На принятие: 1500 сек
+"""
 
-    await message.answer("❌ Нет свободных заявок")
+    await message.answer(text, reply_markup=order_keyboard(order_id))
 
-# ====== ПРОСТОЙ ЧАТ В ЗАЯВКЕ ======
-@dp.message()
-async def fallback(message: types.Message):
-    text = message.text
+# ===== TAKE ORDER (SAFE) =====
+@dp.callback_query(F.data.startswith("take_"))
+async def take_order(call: types.CallbackQuery):
 
-    # если это число → считаем сумму заявки
-    if text.isdigit():
-        amt = int(text)
+    order_id = int(call.data.split("_")[1])
 
-        # создаём заявку с суммой
-        global order_id
-        orders[order_id] = {
-            "id": order_id,
-            "user_id": message.from_user.id,
-            "status": "NEW",
-            "worker_id": None,
-            "amount": amt
-        }
+    cur.execute("SELECT status FROM orders WHERE id=?", (order_id,))
+    order = cur.fetchone()
 
-        await message.answer(f"💰 Заявка #{order_id} на {amt} RUB создана")
-        order_id += 1
-        return
+    if not order:
+        return await call.answer("Заявка не найдена", show_alert=True)
 
-    await message.answer("Используй меню 👇", reply_markup=main_menu())
+    if order[0] != "NEW":
+        return await call.answer("Уже взято другим", show_alert=True)
 
-# ====== ЗАПУСК ======
+    cur.execute("""
+        UPDATE orders
+        SET status='IN_PROGRESS', worker_id=?
+        WHERE id=?
+    """, (call.from_user.id, order_id))
+    conn.commit()
+
+    await call.answer("Ты взял заявку ❤️")
+
+    await call.message.edit_text(
+        call.message.text + "\n\n🟢 В РАБОТЕ"
+    )
+
+# ===== BACK =====
+@dp.callback_query(F.data == "back")
+async def back(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.edit_text("🔙 Назад")
+
+# ===== RUN =====
 async def main():
     await dp.start_polling(bot)
 
